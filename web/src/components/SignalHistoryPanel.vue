@@ -12,7 +12,11 @@ import type { SignalHistoryRange, SignalHistoryResponse, SignalHistorySetting } 
 
 use([CanvasRenderer, LineChart, DataZoomComponent, GridComponent, LegendComponent, TooltipComponent])
 
-const props = defineProps<{ deviceId: string }>()
+const props = defineProps<{
+  deviceId: string
+  iccid?: string
+  profileName?: string
+}>()
 const range = ref<SignalHistoryRange>('day')
 const history = ref<SignalHistoryResponse | null>(null)
 const setting = ref<SignalHistorySetting | null>(null)
@@ -36,6 +40,12 @@ const points = computed(() => history.value?.points || [])
 const hasData = computed(() => points.value.some(point =>
   [point.rssi, point.rsrp, point.rsrq, point.sinr, point.nr5g_sinr].some(value => typeof value === 'number')
 ))
+const profileLabel = computed(() => {
+  const name = props.profileName?.trim() || ''
+  const iccid = props.iccid?.trim() || ''
+  const shortICCID = iccid ? `••••${iccid.slice(-6)}` : ''
+  return [name, shortICCID].filter(Boolean).join(' · ')
+})
 
 async function loadHistory(showLoading = true) {
   const id = props.deviceId.trim()
@@ -119,7 +129,12 @@ const chartOption = computed(() => {
   }
 })
 
-watch(() => [props.deviceId, range.value] as const, () => void loadHistory(), { immediate: true })
+watch(() => [props.deviceId, props.iccid] as const, () => {
+  history.value = null
+  void loadHistory()
+}, { immediate: true })
+
+watch(range, () => void loadHistory())
 
 onMounted(() => {
   void loadSetting()
@@ -141,7 +156,10 @@ onBeforeUnmount(() => {
     <div class="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3 mb-4">
       <div>
         <div class="text-sm font-bold text-gray-800 dark:text-gray-100">信号强度历史</div>
-        <div class="text-xs text-gray-400 mt-1">每分钟保存一次，长时间范围自动聚合</div>
+        <div class="text-xs text-gray-400 mt-1">
+          <template v-if="profileLabel">当前 eSIM：{{ profileLabel }}；每分钟保存一次</template>
+          <template v-else>等待 SIM/eSIM 身份确认，切换期间暂停记录</template>
+        </div>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <el-radio-group :model-value="range" size="small" @change="handleRangeChange">
@@ -160,7 +178,7 @@ onBeforeUnmount(() => {
     <div v-else-if="loading && !history" class="h-[260px]" v-loading="true" />
     <VChart v-else-if="hasData" :option="chartOption" autoresize class="h-[320px] w-full" />
     <div v-else class="h-[220px] rounded-xl border border-dashed border-gray-200 dark:border-white/10 flex items-center justify-center text-sm text-gray-400">
-      暂无信号历史数据，新数据将按分钟写入
+      {{ history && !history.identity_ready ? 'eSIM 切换中，身份确认后将自动显示新 Profile 的历史' : '当前 SIM/eSIM 暂无信号历史数据' }}
     </div>
   </section>
 </template>

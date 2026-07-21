@@ -375,7 +375,13 @@ const networkPanelMessage = computed(() => {
       </div>
     </div>
 
-    <SignalHistoryPanel v-if="device?.id" :device-id="device.id" class="lg:col-span-3" />
+    <SignalHistoryPanel
+      v-if="device?.id"
+      :device-id="device.id"
+      :iccid="device.modem?.iccid || ''"
+      :profile-name="device.active_esim_profile_name || ''"
+      class="lg:col-span-3"
+    />
 
     <!-- 运营商选择弹窗 -->
     <OperatorSelectionDialog

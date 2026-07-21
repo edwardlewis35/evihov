@@ -167,6 +167,9 @@ func Init(dbPath string) error {
 	); err != nil {
 		return err
 	}
+	if err := migrateSignalHistoryICCIDSchema(DB); err != nil {
+		return err
+	}
 	if err := ensureSignalHistorySetting(DB); err != nil {
 		return err
 	}

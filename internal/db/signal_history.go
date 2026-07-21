@@ -19,8 +19,9 @@ const (
 
 type SignalHistory struct {
 	ID         uint      `gorm:"primaryKey" json:"id"`
-	DeviceID   string    `gorm:"not null;size:128;uniqueIndex:uk_signal_history_device_time,priority:1;index:idx_signal_history_device_time,priority:1" json:"device_id"`
-	RecordedAt time.Time `gorm:"not null;uniqueIndex:uk_signal_history_device_time,priority:2;index:idx_signal_history_device_time,priority:2" json:"recorded_at"`
+	DeviceID   string    `gorm:"not null;size:128;uniqueIndex:uk_signal_history_device_iccid_time,priority:1;index:idx_signal_history_device_iccid_time,priority:1" json:"device_id"`
+	ICCID      string    `gorm:"column:iccid;not null;default:'';size:64;uniqueIndex:uk_signal_history_device_iccid_time,priority:2;index:idx_signal_history_device_iccid_time,priority:2" json:"iccid"`
+	RecordedAt time.Time `gorm:"not null;uniqueIndex:uk_signal_history_device_iccid_time,priority:3;index:idx_signal_history_device_iccid_time,priority:3" json:"recorded_at"`
 	RSSI       *int      `gorm:"column:rssi" json:"rssi,omitempty"`
 	RSRP       *int      `gorm:"column:rsrp" json:"rsrp,omitempty"`
 	RSRQ       *int      `gorm:"column:rsrq" json:"rsrq,omitempty"`
@@ -40,6 +41,17 @@ type SignalHistorySetting struct {
 }
 
 func (SignalHistorySetting) TableName() string { return "signal_history_settings" }
+
+// migrateSignalHistoryICCIDSchema removes the device-only uniqueness left by
+// the first version of signal history. Rows without ICCID stay unassigned and
+// are deliberately excluded from per-profile queries.
+func migrateSignalHistoryICCIDSchema(tx *gorm.DB) error {
+	const legacyIndex = "uk_signal_history_device_time"
+	if tx.Migrator().HasIndex(&SignalHistory{}, legacyIndex) {
+		return tx.Migrator().DropIndex(&SignalHistory{}, legacyIndex)
+	}
+	return nil
+}
 
 type SignalValues struct {
 	RSSI, RSRP, RSRQ, SINR, NR5GSINR int
@@ -138,19 +150,20 @@ func DeleteSignalHistoryForDevice(deviceID string) error {
 	return DB.Where("device_id = ?", deviceID).Delete(&SignalHistory{}).Error
 }
 
-func RecordSignalHistory(deviceID string, recordedAt time.Time, values SignalValues) error {
+func RecordSignalHistory(deviceID, iccid string, recordedAt time.Time, values SignalValues) error {
 	if DB == nil {
 		return fmt.Errorf("db not initialized")
 	}
 	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" {
-		return fmt.Errorf("device_id is required")
+	iccid = strings.TrimSpace(iccid)
+	if deviceID == "" || iccid == "" {
+		return fmt.Errorf("device_id and iccid are required")
 	}
 	if recordedAt.IsZero() {
 		recordedAt = time.Now()
 	}
 	row := SignalHistory{
-		DeviceID: deviceID, RecordedAt: recordedAt.UTC().Truncate(time.Minute),
+		DeviceID: deviceID, ICCID: iccid, RecordedAt: recordedAt.UTC().Truncate(time.Minute),
 		RSSI: validSignalValue(values.RSSI), RSRP: validSignalValue(values.RSRP),
 		RSRQ: validSignalValue(values.RSRQ), SINR: validSignalValue(values.SINR),
 		NR5GSINR: validSignalValue(values.NR5GSINR),
@@ -159,7 +172,7 @@ func RecordSignalHistory(deviceID string, recordedAt time.Time, values SignalVal
 		return nil
 	}
 	return DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "device_id"}, {Name: "recorded_at"}},
+		Columns: []clause.Column{{Name: "device_id"}, {Name: "iccid"}, {Name: "recorded_at"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"rssi":       gorm.Expr("COALESCE(excluded.rssi, signal_history.rssi)"),
 			"rsrp":       gorm.Expr("COALESCE(excluded.rsrp, signal_history.rsrp)"),
@@ -185,12 +198,13 @@ type signalHistoryAggregateRow struct {
 	SampleCount                      int64
 }
 
-func GetSignalHistory(deviceID string, since, until time.Time, bucket time.Duration) ([]SignalHistoryPoint, error) {
+func GetSignalHistory(deviceID, iccid string, since, until time.Time, bucket time.Duration) ([]SignalHistoryPoint, error) {
 	if DB == nil {
 		return nil, fmt.Errorf("db not initialized")
 	}
 	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" || since.IsZero() || until.IsZero() || !since.Before(until) || bucket < time.Minute {
+	iccid = strings.TrimSpace(iccid)
+	if deviceID == "" || iccid == "" || since.IsZero() || until.IsZero() || !since.Before(until) || bucket < time.Minute {
 		return nil, fmt.Errorf("invalid signal history query")
 	}
 	seconds := int64(bucket / time.Second)
@@ -200,9 +214,9 @@ func GetSignalHistory(deviceID string, since, until time.Time, bucket time.Durat
 		AVG(rssi) AS rssi, AVG(rsrp) AS rsrp, AVG(rsrq) AS rsrq,
 		AVG(sinr) AS sinr, AVG(nr5g_sinr) AS nr5g_sinr, COUNT(*) AS sample_count
 		FROM signal_history
-		WHERE device_id = ? AND recorded_at >= ? AND recorded_at <= ?
+		WHERE device_id = ? AND iccid = ? AND recorded_at >= ? AND recorded_at <= ?
 		GROUP BY bucket_unix HAVING bucket_unix IS NOT NULL ORDER BY bucket_unix ASC`
-	if err := DB.Raw(query, seconds, seconds, deviceID, since.UTC(), until.UTC()).Scan(&rows).Error; err != nil {
+	if err := DB.Raw(query, seconds, seconds, deviceID, iccid, since.UTC(), until.UTC()).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	points := make([]SignalHistoryPoint, 0, len(rows))

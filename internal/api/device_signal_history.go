@@ -13,6 +13,8 @@ import (
 
 type signalHistoryResponse struct {
 	DeviceID      string                  `json:"device_id"`
+	ICCID         string                  `json:"iccid"`
+	IdentityReady bool                    `json:"identity_ready"`
 	Range         string                  `json:"range"`
 	RetentionDays int                     `json:"retention_days"`
 	Since         time.Time               `json:"since"`
@@ -44,15 +46,33 @@ func (s *Server) handleGetDeviceSignalHistory(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
-	points, err := db.GetSignalHistory(deviceID, since, now, bucket)
+	iccid := s.confirmedSignalHistoryICCID(deviceID)
+	if iccid == "" {
+		c.JSON(http.StatusOK, signalHistoryResponse{
+			DeviceID: deviceID, ICCID: "", IdentityReady: false,
+			Range: rangeName, RetentionDays: days, Since: since, Until: now,
+			BucketSeconds: int64(bucket / time.Second), Points: make([]db.SignalHistoryPoint, 0),
+		})
+		return
+	}
+	points, err := db.GetSignalHistory(deviceID, iccid, since, now, bucket)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, signalHistoryResponse{
-		DeviceID: deviceID, Range: rangeName, RetentionDays: days,
+		DeviceID: deviceID, ICCID: iccid, IdentityReady: true, Range: rangeName, RetentionDays: days,
 		Since: since, Until: now, BucketSeconds: int64(bucket / time.Second), Points: points,
 	})
+}
+
+func (s *Server) confirmedSignalHistoryICCID(deviceID string) string {
+	if s != nil && s.pool != nil {
+		if worker := s.pool.GetWorker(deviceID); worker != nil {
+			return strings.TrimSpace(worker.ConfirmedICCID())
+		}
+	}
+	return strings.TrimSpace(db.CurrentICCIDForDevice(deviceID))
 }
 
 func (s *Server) handleGetSignalHistorySetting(c *gin.Context) {

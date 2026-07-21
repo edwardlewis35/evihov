@@ -3,6 +3,9 @@ package api
 import (
 	"testing"
 	"time"
+
+	"github.com/boa-z/vohive/internal/config"
+	"github.com/boa-z/vohive/internal/device"
 )
 
 func TestResolveSignalHistoryRange(t *testing.T) {
@@ -22,5 +25,24 @@ func TestResolveSignalHistoryRange(t *testing.T) {
 	}
 	if _, _, _, err := resolveSignalHistoryRange("invalid", now, 30); err == nil {
 		t.Fatal("invalid range accepted")
+	}
+}
+
+func TestConfirmedSignalHistoryICCIDDoesNotExposeSwitchTarget(t *testing.T) {
+	pool := device.NewPool(&config.Config{})
+	worker := &device.Worker{ID: "DJI"}
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "ICCID"}, "iccid-a")
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "Ready"}, true)
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "Phase"}, "ready")
+	injectWorker(pool, worker)
+	s := &Server{pool: pool}
+	if got := s.confirmedSignalHistoryICCID("DJI"); got != "iccid-a" {
+		t.Fatalf("confirmed ICCID=%q", got)
+	}
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "TargetICCID"}, "iccid-b")
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "Ready"}, false)
+	setNestedPrivateField(t, worker, []string{"state", "Identity", "Phase"}, "transitioning")
+	if got := s.confirmedSignalHistoryICCID("DJI"); got != "" {
+		t.Fatalf("switch target leaked into history query: %q", got)
 	}
 }

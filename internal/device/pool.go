@@ -153,6 +153,7 @@ type Worker struct {
 
 	signalHistoryMu     sync.Mutex
 	signalHistoryMinute time.Time
+	signalHistoryICCID  string
 
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
@@ -518,6 +519,7 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
 		defer cancel()
 	}
 
+	historyICCID, historyGeneration := w.confirmedSignalHistoryIdentity()
 	status := w.collectRuntimeStatus(ctx, reason)
 	healthy := w.IsDeviceHealthy()
 
@@ -527,29 +529,37 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
 		w.state.Meta.Healthy = healthy
 	}
 	w.cacheMu.Unlock()
-	if err := w.persistSignalHistory(status, time.Now()); err != nil {
-		logger.Warn("保存信号历史失败", "device", w.ID, "err", err)
+	confirmedICCID, confirmedGeneration := w.confirmedSignalHistoryIdentity()
+	if historyICCID != "" && historyICCID == confirmedICCID && historyGeneration == confirmedGeneration {
+		if err := w.persistSignalHistory(status, confirmedICCID, time.Now()); err != nil {
+			logger.Warn("保存信号历史失败", "device", w.ID, "iccid", confirmedICCID, "err", err)
+		}
 	}
 	return nil
 }
 
-func (w *Worker) persistSignalHistory(status modem.DeviceStatus, recordedAt time.Time) error {
+func (w *Worker) persistSignalHistory(status modem.DeviceStatus, iccid string, recordedAt time.Time) error {
 	if w == nil || db.DB == nil {
+		return nil
+	}
+	iccid = strings.TrimSpace(iccid)
+	if iccid == "" {
 		return nil
 	}
 	minute := recordedAt.UTC().Truncate(time.Minute)
 	w.signalHistoryMu.Lock()
 	defer w.signalHistoryMu.Unlock()
-	if !w.signalHistoryMinute.IsZero() && w.signalHistoryMinute.Equal(minute) {
+	if w.signalHistoryICCID == iccid && !w.signalHistoryMinute.IsZero() && w.signalHistoryMinute.Equal(minute) {
 		return nil
 	}
-	if err := db.RecordSignalHistory(w.ID, minute, db.SignalValues{
+	if err := db.RecordSignalHistory(w.ID, iccid, minute, db.SignalValues{
 		RSSI: status.SignalDBM, RSRP: status.SignalRSRP, RSRQ: status.SignalRSRQ,
 		SINR: status.SignalSINR, NR5GSINR: status.NR5GSignalSINR,
 	}); err != nil {
 		return err
 	}
 	w.signalHistoryMinute = minute
+	w.signalHistoryICCID = iccid
 	return nil
 }
 

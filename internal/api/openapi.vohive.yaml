@@ -2452,6 +2452,12 @@ components:
       type: object
       properties:
         device_id: { type: string }
+        iccid:
+          type: string
+          description: 当前已确认的 SIM/eSIM ICCID；切换收敛期间为空。
+        identity_ready:
+          type: boolean
+          description: 当前 ICCID 是否已完成身份确认。
         range:
           type: string
           enum: [day, week, month, retention]

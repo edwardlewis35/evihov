@@ -217,6 +217,8 @@ export type SignalHistoryPoint = {
 }
 export type SignalHistoryResponse = {
   device_id: string
+  iccid: string
+  identity_ready: boolean
   range: SignalHistoryRange
   retention_days: number
   since: string

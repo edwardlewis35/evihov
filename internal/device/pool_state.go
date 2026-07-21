@@ -406,3 +406,25 @@ func (w *Worker) CurrentICCID() string {
 	}
 	return w.state.Identity.ICCID
 }
+
+// ConfirmedICCID returns only the ICCID that has completed identity
+// convergence. Unlike CurrentICCID it never exposes TargetICCID during an
+// eSIM switch, so callers cannot attribute old-card data to the new profile.
+func (w *Worker) ConfirmedICCID() string {
+	iccid, _ := w.confirmedSignalHistoryIdentity()
+	return iccid
+}
+
+func (w *Worker) confirmedSignalHistoryIdentity() (string, uint64) {
+	if w == nil {
+		return "", 0
+	}
+	w.cacheMu.RLock()
+	defer w.cacheMu.RUnlock()
+	identity := w.state.Identity
+	if !identity.Ready || strings.TrimSpace(identity.TargetICCID) != "" ||
+		identity.Phase == simIdentityPhaseTransitioning || identity.Phase == simIdentityPhaseDegraded {
+		return "", identity.Generation
+	}
+	return strings.TrimSpace(identity.ICCID), identity.Generation
+}
