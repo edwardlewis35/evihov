@@ -205,31 +205,6 @@ export type ModemStatus = {
   operating_mode?: number
 }
 
-export type SignalHistoryRange = 'day' | 'week' | 'month' | 'retention'
-export type SignalHistoryPoint = {
-  recorded_at: string
-  rssi: number | null
-  rsrp: number | null
-  rsrq: number | null
-  sinr: number | null
-  nr5g_sinr: number | null
-  sample_count: number
-}
-export type SignalHistoryResponse = {
-  device_id: string
-  range: SignalHistoryRange
-  retention_days: number
-  since: string
-  until: string
-  bucket_seconds: number
-  points: SignalHistoryPoint[]
-}
-export type SignalHistorySetting = {
-  retention_days: number
-  min_days: number
-  max_days: number
-}
-
 export type EsimSpaceDelta = {
   direction: 'released' | 'consumed'
   bytes: number

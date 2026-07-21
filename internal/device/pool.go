@@ -151,9 +151,6 @@ type Worker struct {
 	healthGraceUntil          time.Time
 	healthSnapshot            HealthSnapshot
 
-	signalHistoryMu     sync.Mutex
-	signalHistoryMinute time.Time
-
 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
 	// switchEvents receives UIM indications for the active eSIM switch; nil outside switch convergence.
@@ -527,29 +524,6 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
 		w.state.Meta.Healthy = healthy
 	}
 	w.cacheMu.Unlock()
-	if err := w.persistSignalHistory(status, time.Now()); err != nil {
-		logger.Warn("保存信号历史失败", "device", w.ID, "err", err)
-	}
-	return nil
-}
-
-func (w *Worker) persistSignalHistory(status modem.DeviceStatus, recordedAt time.Time) error {
-	if w == nil || db.DB == nil {
-		return nil
-	}
-	minute := recordedAt.UTC().Truncate(time.Minute)
-	w.signalHistoryMu.Lock()
-	defer w.signalHistoryMu.Unlock()
-	if !w.signalHistoryMinute.IsZero() && w.signalHistoryMinute.Equal(minute) {
-		return nil
-	}
-	if err := db.RecordSignalHistory(w.ID, minute, db.SignalValues{
-		RSSI: status.SignalDBM, RSRP: status.SignalRSRP, RSRQ: status.SignalRSRQ,
-		SINR: status.SignalSINR, NR5GSINR: status.NR5GSignalSINR,
-	}); err != nil {
-		return err
-	}
-	w.signalHistoryMinute = minute
 	return nil
 }
 

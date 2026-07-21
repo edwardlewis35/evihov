@@ -139,24 +139,6 @@ func main() {
 	if err := db.Init(dbPath); err != nil {
 		log.Fatalf("初始化数据库失败: %v", err)
 	}
-	signalHistoryCleanupStop := make(chan struct{})
-	if err := db.CleanupSignalHistory(time.Now()); err != nil {
-		logger.Warn("启动时清理过期信号历史失败", "err", err)
-	}
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := db.CleanupSignalHistory(time.Now()); err != nil {
-					logger.Warn("定时清理过期信号历史失败", "err", err)
-				}
-			case <-signalHistoryCleanupStop:
-				return
-			}
-		}
-	}()
 	dbResolvedPath := dbPath
 	if absPath, err := filepath.Abs(dbPath); err == nil {
 		dbResolvedPath = absPath
@@ -409,7 +391,6 @@ func main() {
 	case err := <-apiErrCh:
 		logger.Error("API 服务器失败", "err", err)
 	}
-	close(signalHistoryCleanupStop)
 	logger.Info("正在优雅关闭所有服务...")
 
 	// 9. 优雅关闭

@@ -7,7 +7,6 @@ import { activeEsimProfileDisplayName } from './deviceOverviewActiveEsim'
 import { isControlOnline, isRadioRegistered, isRecoveryPhase, lifecycleStatusLabel } from '../utils/deviceLifecycle'
 import StatusLight from './StatusLight.vue'
 import OperatorSelectionDialog from './OperatorSelectionDialog.vue'
-import SignalHistoryPanel from './SignalHistoryPanel.vue'
 import { Settings24Regular } from '@vicons/fluent'
 import type { StatusLightTone } from './statusLight'
 
@@ -374,8 +373,6 @@ const networkPanelMessage = computed(() => {
         <FieldRow label="实时上传速率"    :value="trafficUploadRateDisplay"     monospace />
       </div>
     </div>
-
-    <SignalHistoryPanel v-if="device?.id" :device-id="device.id" class="lg:col-span-3" />
 
     <!-- 运营商选择弹窗 -->
     <OperatorSelectionDialog

@@ -1,6 +1,6 @@
 import { api } from '../stores/auth'
 import { callService } from './http'
-import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta, SignalHistoryRange, SignalHistoryResponse, SignalHistorySetting } from '../types/api'
+import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta } from '../types/api'
 import type { DeviceDetailVM, DeviceListVM } from '../types/view-model'
 import axios from 'axios'
 
@@ -115,24 +115,6 @@ export const devicesService = {
     return callService(async () => {
       const res = await api.get(`/devices/${id}/overview`, { signal })
       return ((res.data?.devices || [])[0] || null) as DeviceDetailVM | null
-    })
-  },
-  getSignalHistory(id: string, range: SignalHistoryRange, signal?: AbortSignal) {
-    return callService(async () => {
-      const res = await api.get<SignalHistoryResponse>(`/devices/${id}/signal-history`, { params: { range }, signal })
-      return res.data
-    })
-  },
-  getSignalHistorySetting(signal?: AbortSignal) {
-    return callService(async () => {
-      const res = await api.get<SignalHistorySetting>('/settings/signal-history', { signal })
-      return res.data
-    })
-  },
-  updateSignalHistorySetting(retentionDays: number) {
-    return callService(async () => {
-      const res = await api.put<SignalHistorySetting>('/settings/signal-history', { retention_days: retentionDays })
-      return res.data
     })
   },
   getConfig(id: string) {
