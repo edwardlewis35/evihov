@@ -1449,6 +1449,9 @@ func (s *Server) handleDeviceMgmtDeleteDevice(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
+	if err := db.DeleteSignalHistoryForDevice(id); err != nil {
+		logger.Warn("删除设备信号历史失败", "device_id", id, "err", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

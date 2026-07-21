@@ -162,7 +162,12 @@ func Init(dbPath string) error {
 		&TrafficDay{},
 		&TrafficWeek{},
 		&TrafficMonth{},
+		&SignalHistory{},
+		&SignalHistorySetting{},
 	); err != nil {
+		return err
+	}
+	if err := ensureSignalHistorySetting(DB); err != nil {
 		return err
 	}
 	if err := migrateSIMCardsToSubscriptions(DB); err != nil {
