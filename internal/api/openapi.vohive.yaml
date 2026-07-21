@@ -489,6 +489,40 @@ paths:
         '500':
           $ref: '#/components/responses/ErrorMessage'
 
+  /settings/signal-history:
+    get:
+      tags: [settings]
+      summary: 获取信号历史保留设置
+      responses:
+        '200':
+          description: 当前设置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignalHistorySetting'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+    put:
+      tags: [settings]
+      summary: 更新保留天数并立即清理过期记录
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSignalHistorySettingRequest'
+      responses:
+        '200':
+          description: 更新后的设置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignalHistorySetting'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
+
   /settings/notifications/weixin/qr/start:
     post:
       tags: [settings]
@@ -679,6 +713,30 @@ paths:
                       $ref: '#/components/schemas/DeviceMgmtOverviewLiteItem'
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /devices/{device_id}/signal-history:
+    get:
+      tags: [devices]
+      summary: 获取设备信号强度历史
+      parameters:
+        - $ref: '#/components/parameters/DeviceIDPath'
+        - in: query
+          name: range
+          schema:
+            type: string
+            enum: [day, week, month, retention]
+            default: day
+      responses:
+        '200':
+          description: 聚合信号时间序列
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignalHistoryResponse'
+        '400':
+          $ref: '#/components/responses/ErrorMessage'
+        '500':
+          $ref: '#/components/responses/ErrorMessage'
 
   /devices/{device_id}/config:
     get:
@@ -2352,6 +2410,65 @@ components:
     UpdateNotificationSettingsRequest:
       allOf:
         - $ref: '#/components/schemas/NotificationSettings'
+
+    SignalHistorySetting:
+      type: object
+      required: [retention_days, min_days, max_days]
+      properties:
+        retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        min_days:
+          type: integer
+        max_days:
+          type: integer
+
+    UpdateSignalHistorySettingRequest:
+      type: object
+      required: [retention_days]
+      properties:
+        retention_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+
+    SignalHistoryPoint:
+      type: object
+      properties:
+        recorded_at:
+          type: string
+          format: date-time
+        rssi: { type: number, nullable: true }
+        rsrp: { type: number, nullable: true }
+        rsrq: { type: number, nullable: true }
+        sinr: { type: number, nullable: true }
+        nr5g_sinr: { type: number, nullable: true }
+        sample_count:
+          type: integer
+          format: int64
+
+    SignalHistoryResponse:
+      type: object
+      properties:
+        device_id: { type: string }
+        iccid:
+          type: string
+          description: 当前已确认的 SIM/eSIM ICCID；切换收敛期间为空。
+        identity_ready:
+          type: boolean
+          description: 当前 ICCID 是否已完成身份确认。
+        range:
+          type: string
+          enum: [day, week, month, retention]
+        retention_days: { type: integer }
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        bucket_seconds: { type: integer, format: int64 }
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignalHistoryPoint'
 
     TestWebhookRequest:
       type: object

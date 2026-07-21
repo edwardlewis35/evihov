@@ -1,0 +1,1274 @@
+diff --git a/cmd/vohive/main.go b/cmd/vohive/main.go
+index 63fb51db14c9f814a76a71b46015f1c9c4f12bf0..80ba3f9e1e6eeed270c660b9db7d9d48a77b55dc 100644
+--- a/cmd/vohive/main.go
++++ b/cmd/vohive/main.go
+@@ -139,6 +139,24 @@ func main() {
+ 	if err := db.Init(dbPath); err != nil {
+ 		log.Fatalf("初始化数据库失败: %v", err)
+ 	}
++	signalHistoryCleanupStop := make(chan struct{})
++	if err := db.CleanupSignalHistory(time.Now()); err != nil {
++		logger.Warn("启动时清理过期信号历史失败", "err", err)
++	}
++	go func() {
++		ticker := time.NewTicker(24 * time.Hour)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-ticker.C:
++				if err := db.CleanupSignalHistory(time.Now()); err != nil {
++					logger.Warn("定时清理过期信号历史失败", "err", err)
++				}
++			case <-signalHistoryCleanupStop:
++				return
++			}
++		}
++	}()
+ 	dbResolvedPath := dbPath
+ 	if absPath, err := filepath.Abs(dbPath); err == nil {
+ 		dbResolvedPath = absPath
+@@ -391,6 +409,7 @@ func main() {
+ 	case err := <-apiErrCh:
+ 		logger.Error("API 服务器失败", "err", err)
+ 	}
++	close(signalHistoryCleanupStop)
+ 	logger.Info("正在优雅关闭所有服务...")
+ 
+ 	// 9. 优雅关闭
+diff --git a/internal/api/device_mgmt.go b/internal/api/device_mgmt.go
+index 19a9cb1f702e532224612ebb0ef33ad38efa848e..6c4e1d7b9405bdfacf9d3bf0b4297629ae52ccf4 100644
+--- a/internal/api/device_mgmt.go
++++ b/internal/api/device_mgmt.go
+@@ -1449,6 +1449,9 @@ func (s *Server) handleDeviceMgmtDeleteDevice(c *gin.Context) {
+ 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": err.Error()})
+ 		return
+ 	}
++	if err := db.DeleteSignalHistoryForDevice(id); err != nil {
++		logger.Warn("删除设备信号历史失败", "device_id", id, "err", err)
++	}
+ 
+ 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+ }
+diff --git a/internal/api/device_signal_history.go b/internal/api/device_signal_history.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..191920a3d41e97c85227678672c4abd41a9b4f63
+--- /dev/null
++++ b/internal/api/device_signal_history.go
+@@ -0,0 +1,132 @@
++package api
++
++import (
++	"fmt"
++	"math"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/boa-z/vohive/internal/db"
++	"github.com/gin-gonic/gin"
++)
++
++type signalHistoryResponse struct {
++	DeviceID      string                  `json:"device_id"`
++	ICCID         string                  `json:"iccid"`
++	IdentityReady bool                    `json:"identity_ready"`
++	Range         string                  `json:"range"`
++	RetentionDays int                     `json:"retention_days"`
++	Since         time.Time               `json:"since"`
++	Until         time.Time               `json:"until"`
++	BucketSeconds int64                   `json:"bucket_seconds"`
++	Points        []db.SignalHistoryPoint `json:"points"`
++}
++
++type signalHistorySettingResponse struct {
++	RetentionDays int `json:"retention_days"`
++	MinDays       int `json:"min_days"`
++	MaxDays       int `json:"max_days"`
++}
++
++func (s *Server) handleGetDeviceSignalHistory(c *gin.Context) {
++	deviceID := strings.TrimSpace(deviceIDParam(c))
++	if deviceID == "" {
++		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "device_id 不能为空"})
++		return
++	}
++	days, err := db.GetSignalHistoryRetentionDays()
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
++		return
++	}
++	now := time.Now().UTC()
++	rangeName, since, bucket, err := resolveSignalHistoryRange(c.DefaultQuery("range", "day"), now, days)
++	if err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
++		return
++	}
++	iccid := s.confirmedSignalHistoryICCID(deviceID)
++	if iccid == "" {
++		c.JSON(http.StatusOK, signalHistoryResponse{
++			DeviceID: deviceID, ICCID: "", IdentityReady: false,
++			Range: rangeName, RetentionDays: days, Since: since, Until: now,
++			BucketSeconds: int64(bucket / time.Second), Points: make([]db.SignalHistoryPoint, 0),
++		})
++		return
++	}
++	points, err := db.GetSignalHistory(deviceID, iccid, since, now, bucket)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
++		return
++	}
++	c.JSON(http.StatusOK, signalHistoryResponse{
++		DeviceID: deviceID, ICCID: iccid, IdentityReady: true, Range: rangeName, RetentionDays: days,
++		Since: since, Until: now, BucketSeconds: int64(bucket / time.Second), Points: points,
++	})
++}
++
++func (s *Server) confirmedSignalHistoryICCID(deviceID string) string {
++	if s != nil && s.pool != nil {
++		if worker := s.pool.GetWorker(deviceID); worker != nil {
++			return strings.TrimSpace(worker.ConfirmedICCID())
++		}
++	}
++	return strings.TrimSpace(db.CurrentICCIDForDevice(deviceID))
++}
++
++func (s *Server) handleGetSignalHistorySetting(c *gin.Context) {
++	days, err := db.GetSignalHistoryRetentionDays()
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
++		return
++	}
++	c.JSON(http.StatusOK, newSignalHistorySettingResponse(days))
++}
++
++func (s *Server) handleUpdateSignalHistorySetting(c *gin.Context) {
++	var req struct {
++		RetentionDays int `json:"retention_days" binding:"required"`
++	}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "retention_days 必须是整数"})
++		return
++	}
++	if err := db.SetSignalHistoryRetentionDays(req.RetentionDays, time.Now()); err != nil {
++		status := http.StatusInternalServerError
++		if db.ValidateSignalHistoryRetentionDays(req.RetentionDays) != nil {
++			status = http.StatusBadRequest
++		}
++		c.JSON(status, gin.H{"status": "error", "message": err.Error()})
++		return
++	}
++	c.JSON(http.StatusOK, newSignalHistorySettingResponse(req.RetentionDays))
++}
++
++func newSignalHistorySettingResponse(days int) signalHistorySettingResponse {
++	return signalHistorySettingResponse{days, db.MinSignalHistoryRetentionDays, db.MaxSignalHistoryRetentionDays}
++}
++
++func resolveSignalHistoryRange(value string, now time.Time, retentionDays int) (string, time.Time, time.Duration, error) {
++	rangeName := strings.ToLower(strings.TrimSpace(value))
++	switch rangeName {
++	case "day":
++		return rangeName, now.Add(-24 * time.Hour), 5 * time.Minute, nil
++	case "week":
++		return rangeName, now.Add(-7 * 24 * time.Hour), 30 * time.Minute, nil
++	case "month":
++		return rangeName, now.Add(-30 * 24 * time.Hour), 2 * time.Hour, nil
++	case "retention":
++		if err := db.ValidateSignalHistoryRetentionDays(retentionDays); err != nil {
++			return "", time.Time{}, 0, err
++		}
++		span := time.Duration(retentionDays) * 24 * time.Hour
++		minutes := int64(math.Ceil(float64(span) / float64(720*time.Minute)))
++		if minutes < 1 {
++			minutes = 1
++		}
++		return rangeName, now.Add(-span), time.Duration(minutes) * time.Minute, nil
++	default:
++		return "", time.Time{}, 0, fmt.Errorf("range 必须是 day、week、month 或 retention")
++	}
++}
+diff --git a/internal/api/device_signal_history_test.go b/internal/api/device_signal_history_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5aed320180859d4de2fd46195bb3f42abb7f8e86
+--- /dev/null
++++ b/internal/api/device_signal_history_test.go
+@@ -0,0 +1,48 @@
++package api
++
++import (
++	"testing"
++	"time"
++
++	"github.com/boa-z/vohive/internal/config"
++	"github.com/boa-z/vohive/internal/device"
++)
++
++func TestResolveSignalHistoryRange(t *testing.T) {
++	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
++	for _, test := range []struct {
++		name         string
++		span, bucket time.Duration
++	}{
++		{"day", 24 * time.Hour, 5 * time.Minute},
++		{"week", 7 * 24 * time.Hour, 30 * time.Minute},
++		{"month", 30 * 24 * time.Hour, 2 * time.Hour},
++	} {
++		name, since, bucket, err := resolveSignalHistoryRange(test.name, now, 30)
++		if err != nil || name != test.name || now.Sub(since) != test.span || bucket != test.bucket {
++			t.Fatalf("range %s: name=%s span=%v bucket=%v err=%v", test.name, name, now.Sub(since), bucket, err)
++		}
++	}
++	if _, _, _, err := resolveSignalHistoryRange("invalid", now, 30); err == nil {
++		t.Fatal("invalid range accepted")
++	}
++}
++
++func TestConfirmedSignalHistoryICCIDDoesNotExposeSwitchTarget(t *testing.T) {
++	pool := device.NewPool(&config.Config{})
++	worker := &device.Worker{ID: "DJI"}
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "ICCID"}, "iccid-a")
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "Ready"}, true)
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "Phase"}, "ready")
++	injectWorker(pool, worker)
++	s := &Server{pool: pool}
++	if got := s.confirmedSignalHistoryICCID("DJI"); got != "iccid-a" {
++		t.Fatalf("confirmed ICCID=%q", got)
++	}
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "TargetICCID"}, "iccid-b")
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "Ready"}, false)
++	setNestedPrivateField(t, worker, []string{"state", "Identity", "Phase"}, "transitioning")
++	if got := s.confirmedSignalHistoryICCID("DJI"); got != "" {
++		t.Fatalf("switch target leaked into history query: %q", got)
++	}
++}
+diff --git a/internal/api/openapi.vohive.yaml b/internal/api/openapi.vohive.yaml
+index 2992df181ae58d3683fcd750b5ede0c68c2edfa8..3fcb07f802bdd39366d59cee3290ea1a6dcf8901 100644
+--- a/internal/api/openapi.vohive.yaml
++++ b/internal/api/openapi.vohive.yaml
+@@ -489,6 +489,40 @@ paths:
+         '500':
+           $ref: '#/components/responses/ErrorMessage'
+ 
++  /settings/signal-history:
++    get:
++      tags: [settings]
++      summary: 获取信号历史保留设置
++      responses:
++        '200':
++          description: 当前设置
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/SignalHistorySetting'
++        '500':
++          $ref: '#/components/responses/ErrorMessage'
++    put:
++      tags: [settings]
++      summary: 更新保留天数并立即清理过期记录
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/UpdateSignalHistorySettingRequest'
++      responses:
++        '200':
++          description: 更新后的设置
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/SignalHistorySetting'
++        '400':
++          $ref: '#/components/responses/ErrorMessage'
++        '500':
++          $ref: '#/components/responses/ErrorMessage'
++
+   /settings/notifications/weixin/qr/start:
+     post:
+       tags: [settings]
+@@ -680,6 +714,30 @@ paths:
+         '401':
+           $ref: '#/components/responses/Unauthorized'
+ 
++  /devices/{device_id}/signal-history:
++    get:
++      tags: [devices]
++      summary: 获取设备信号强度历史
++      parameters:
++        - $ref: '#/components/parameters/DeviceIDPath'
++        - in: query
++          name: range
++          schema:
++            type: string
++            enum: [day, week, month, retention]
++            default: day
++      responses:
++        '200':
++          description: 聚合信号时间序列
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/SignalHistoryResponse'
++        '400':
++          $ref: '#/components/responses/ErrorMessage'
++        '500':
++          $ref: '#/components/responses/ErrorMessage'
++
+   /devices/{device_id}/config:
+     get:
+       tags: [devices]
+@@ -2353,6 +2411,65 @@ components:
+       allOf:
+         - $ref: '#/components/schemas/NotificationSettings'
+ 
++    SignalHistorySetting:
++      type: object
++      required: [retention_days, min_days, max_days]
++      properties:
++        retention_days:
++          type: integer
++          minimum: 1
++          maximum: 3650
++        min_days:
++          type: integer
++        max_days:
++          type: integer
++
++    UpdateSignalHistorySettingRequest:
++      type: object
++      required: [retention_days]
++      properties:
++        retention_days:
++          type: integer
++          minimum: 1
++          maximum: 3650
++
++    SignalHistoryPoint:
++      type: object
++      properties:
++        recorded_at:
++          type: string
++          format: date-time
++        rssi: { type: number, nullable: true }
++        rsrp: { type: number, nullable: true }
++        rsrq: { type: number, nullable: true }
++        sinr: { type: number, nullable: true }
++        nr5g_sinr: { type: number, nullable: true }
++        sample_count:
++          type: integer
++          format: int64
++
++    SignalHistoryResponse:
++      type: object
++      properties:
++        device_id: { type: string }
++        iccid:
++          type: string
++          description: 当前已确认的 SIM/eSIM ICCID；切换收敛期间为空。
++        identity_ready:
++          type: boolean
++          description: 当前 ICCID 是否已完成身份确认。
++        range:
++          type: string
++          enum: [day, week, month, retention]
++        retention_days: { type: integer }
++        since: { type: string, format: date-time }
++        until: { type: string, format: date-time }
++        bucket_seconds: { type: integer, format: int64 }
++        points:
++          type: array
++          items:
++            $ref: '#/components/schemas/SignalHistoryPoint'
++
+     TestWebhookRequest:
+       type: object
+       required: [enabled, urls, timeout_ms, retry_max]
+diff --git a/internal/api/server.go b/internal/api/server.go
+index 66c409e08215e807cfb878a279ea4ae21f9f7e98..c232dd474d794a6324b5f87d3a092b2290958563 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -252,6 +252,8 @@ func (s *Server) newRouter() *gin.Engine {
+ 		// ===== 系统设置 =====
+ 		api.GET("/settings/notifications", s.handleGetNotificationSettings)    // 获取通知设置
+ 		api.PUT("/settings/notifications", s.handleUpdateNotificationSettings) // 更新通知设置
++		api.GET("/settings/signal-history", s.handleGetSignalHistorySetting)
++		api.PUT("/settings/signal-history", s.handleUpdateSignalHistorySetting)
+ 		api.POST("/settings/notifications/webhook/test", s.handleTestWebhookNotification)
+ 		api.POST("/settings/notifications/bark/test", s.handleTestBarkNotification)
+ 		api.POST("/settings/notifications/email/test", s.handleTestEmailNotification)
+@@ -266,17 +268,18 @@ func (s *Server) newRouter() *gin.Engine {
+ 		api.POST("/devices/actions/rescan", s.handleDeviceRescan)                              // 手动触发设备重扫描
+ 		api.GET("/devices/:device_id/overview/stream", s.handleDeviceMgmtOverviewStreamSingle) // SSE 单体深层实时流
+ 		api.GET("/devices/:device_id/overview", s.handleDeviceMgmtOverviewLite)                // 获取设备详情（轻量版）
+-		api.GET("/devices/:device_id/config", s.handleDeviceMgmtGetDeviceConfig)               // 获取设备配置
+-		api.PUT("/devices/:device_id", s.handleDeviceMgmtUpdateDevice)                         // 更新设备配置
+-		api.DELETE("/devices/:device_id", s.handleDeviceMgmtDeleteDevice)                      // 删除设备
+-		api.POST("/devices/:device_id/actions/refresh", s.handleDeviceMgmtRefreshInfo)         // 手动触发刷新设备缓存信息
+-		api.POST("/devices/:device_id/actions/reboot", s.handleDeviceMgmtReboot)               // 重启设备模组
+-		api.POST("/devices/:device_id/actions/at", s.handleDeviceMgmtExecuteAT)                // 执行 AT 命令
+-		api.POST("/devices/:device_id/actions/ussd", s.handleDeviceMgmtExecuteUSSD)            // 执行 USSD 指令
+-		api.POST("/devices/:device_id/actions/ussd/continue", s.handleDeviceMgmtContinueUSSD)  // USSD 续轮输入（多轮交互）
+-		api.POST("/devices/:device_id/actions/ussd/cancel", s.handleDeviceMgmtCancelUSSD)      // 取消 USSD 会话
+-		api.PATCH("/devices/:device_id/usbnet-mode", s.handleDeviceMgmtSetUSBNetMode)          // 设置 USBNET 模式
+-		api.PATCH("/devices/:device_id/flight-mode", s.handleDeviceMgmtSetFlightMode)          // 切换飞行模式
++		api.GET("/devices/:device_id/signal-history", s.handleGetDeviceSignalHistory)
++		api.GET("/devices/:device_id/config", s.handleDeviceMgmtGetDeviceConfig)              // 获取设备配置
++		api.PUT("/devices/:device_id", s.handleDeviceMgmtUpdateDevice)                        // 更新设备配置
++		api.DELETE("/devices/:device_id", s.handleDeviceMgmtDeleteDevice)                     // 删除设备
++		api.POST("/devices/:device_id/actions/refresh", s.handleDeviceMgmtRefreshInfo)        // 手动触发刷新设备缓存信息
++		api.POST("/devices/:device_id/actions/reboot", s.handleDeviceMgmtReboot)              // 重启设备模组
++		api.POST("/devices/:device_id/actions/at", s.handleDeviceMgmtExecuteAT)               // 执行 AT 命令
++		api.POST("/devices/:device_id/actions/ussd", s.handleDeviceMgmtExecuteUSSD)           // 执行 USSD 指令
++		api.POST("/devices/:device_id/actions/ussd/continue", s.handleDeviceMgmtContinueUSSD) // USSD 续轮输入（多轮交互）
++		api.POST("/devices/:device_id/actions/ussd/cancel", s.handleDeviceMgmtCancelUSSD)     // 取消 USSD 会话
++		api.PATCH("/devices/:device_id/usbnet-mode", s.handleDeviceMgmtSetUSBNetMode)         // 设置 USBNET 模式
++		api.PATCH("/devices/:device_id/flight-mode", s.handleDeviceMgmtSetFlightMode)         // 切换飞行模式
+ 		api.PATCH("/devices/:device_id/network", s.handleDeviceNetworkPatch)
+ 
+ 		api.GET("/cards/policies", s.handleListCardPolicies)
+diff --git a/internal/db/db.go b/internal/db/db.go
+index 1cc6e5b54fc0d04180a95756c2ca0b539a30031b..0bdafffa8b2df30226f61fefd81c9b34d0fb9e81 100644
+--- a/internal/db/db.go
++++ b/internal/db/db.go
+@@ -162,9 +162,17 @@ func Init(dbPath string) error {
+ 		&TrafficDay{},
+ 		&TrafficWeek{},
+ 		&TrafficMonth{},
++		&SignalHistory{},
++		&SignalHistorySetting{},
+ 	); err != nil {
+ 		return err
+ 	}
++	if err := migrateSignalHistoryICCIDSchema(DB); err != nil {
++		return err
++	}
++	if err := ensureSignalHistorySetting(DB); err != nil {
++		return err
++	}
+ 	if err := migrateSIMCardsToSubscriptions(DB); err != nil {
+ 		return err
+ 	}
+diff --git a/internal/db/signal_history.go b/internal/db/signal_history.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4102af77bdb3666370290815da757bb6661f6749
+--- /dev/null
++++ b/internal/db/signal_history.go
+@@ -0,0 +1,240 @@
++package db
++
++import (
++	"database/sql"
++	"fmt"
++	"strings"
++	"time"
++
++	"gorm.io/gorm"
++	"gorm.io/gorm/clause"
++)
++
++const (
++	DefaultSignalHistoryRetentionDays = 30
++	MinSignalHistoryRetentionDays     = 1
++	MaxSignalHistoryRetentionDays     = 3650
++	signalHistorySettingID            = 1
++)
++
++type SignalHistory struct {
++	ID         uint      `gorm:"primaryKey" json:"id"`
++	DeviceID   string    `gorm:"not null;size:128;uniqueIndex:uk_signal_history_device_iccid_time,priority:1;index:idx_signal_history_device_iccid_time,priority:1" json:"device_id"`
++	ICCID      string    `gorm:"column:iccid;not null;default:'';size:64;uniqueIndex:uk_signal_history_device_iccid_time,priority:2;index:idx_signal_history_device_iccid_time,priority:2" json:"iccid"`
++	RecordedAt time.Time `gorm:"not null;uniqueIndex:uk_signal_history_device_iccid_time,priority:3;index:idx_signal_history_device_iccid_time,priority:3" json:"recorded_at"`
++	RSSI       *int      `gorm:"column:rssi" json:"rssi,omitempty"`
++	RSRP       *int      `gorm:"column:rsrp" json:"rsrp,omitempty"`
++	RSRQ       *int      `gorm:"column:rsrq" json:"rsrq,omitempty"`
++	SINR       *int      `gorm:"column:sinr" json:"sinr,omitempty"`
++	NR5GSINR   *int      `gorm:"column:nr5g_sinr" json:"nr5g_sinr,omitempty"`
++	CreatedAt  time.Time `json:"created_at"`
++	UpdatedAt  time.Time `json:"updated_at"`
++}
++
++func (SignalHistory) TableName() string { return "signal_history" }
++
++type SignalHistorySetting struct {
++	ID            uint      `gorm:"primaryKey;autoIncrement:false" json:"-"`
++	RetentionDays int       `gorm:"not null;default:30" json:"retention_days"`
++	CreatedAt     time.Time `json:"created_at"`
++	UpdatedAt     time.Time `json:"updated_at"`
++}
++
++func (SignalHistorySetting) TableName() string { return "signal_history_settings" }
++
++// migrateSignalHistoryICCIDSchema removes the device-only uniqueness left by
++// the first version of signal history. Rows without ICCID stay unassigned and
++// are deliberately excluded from per-profile queries.
++func migrateSignalHistoryICCIDSchema(tx *gorm.DB) error {
++	const legacyIndex = "uk_signal_history_device_time"
++	if tx.Migrator().HasIndex(&SignalHistory{}, legacyIndex) {
++		return tx.Migrator().DropIndex(&SignalHistory{}, legacyIndex)
++	}
++	return nil
++}
++
++type SignalValues struct {
++	RSSI, RSRP, RSRQ, SINR, NR5GSINR int
++}
++
++type SignalHistoryPoint struct {
++	RecordedAt  time.Time `json:"recorded_at"`
++	RSSI        *float64  `json:"rssi"`
++	RSRP        *float64  `json:"rsrp"`
++	RSRQ        *float64  `json:"rsrq"`
++	SINR        *float64  `json:"sinr"`
++	NR5GSINR    *float64  `json:"nr5g_sinr"`
++	SampleCount int64     `json:"sample_count"`
++}
++
++func ValidateSignalHistoryRetentionDays(days int) error {
++	if days < MinSignalHistoryRetentionDays || days > MaxSignalHistoryRetentionDays {
++		return fmt.Errorf("retention_days must be between %d and %d", MinSignalHistoryRetentionDays, MaxSignalHistoryRetentionDays)
++	}
++	return nil
++}
++
++func ensureSignalHistorySetting(tx *gorm.DB) error {
++	setting := SignalHistorySetting{ID: signalHistorySettingID, RetentionDays: DefaultSignalHistoryRetentionDays}
++	return tx.Where("id = ?", signalHistorySettingID).FirstOrCreate(&setting).Error
++}
++
++func GetSignalHistoryRetentionDays() (int, error) {
++	if DB == nil {
++		return 0, fmt.Errorf("db not initialized")
++	}
++	if err := ensureSignalHistorySetting(DB); err != nil {
++		return 0, err
++	}
++	var setting SignalHistorySetting
++	if err := DB.First(&setting, signalHistorySettingID).Error; err != nil {
++		return 0, err
++	}
++	if err := ValidateSignalHistoryRetentionDays(setting.RetentionDays); err != nil {
++		return 0, err
++	}
++	return setting.RetentionDays, nil
++}
++
++func SetSignalHistoryRetentionDays(days int, now time.Time) error {
++	if err := ValidateSignalHistoryRetentionDays(days); err != nil {
++		return err
++	}
++	if DB == nil {
++		return fmt.Errorf("db not initialized")
++	}
++	if now.IsZero() {
++		now = time.Now()
++	}
++	return DB.Transaction(func(tx *gorm.DB) error {
++		setting := SignalHistorySetting{ID: signalHistorySettingID, RetentionDays: days}
++		if err := tx.Clauses(clause.OnConflict{
++			Columns:   []clause.Column{{Name: "id"}},
++			DoUpdates: clause.AssignmentColumns([]string{"retention_days", "updated_at"}),
++		}).Create(&setting).Error; err != nil {
++			return err
++		}
++		return deleteExpiredSignalHistory(tx, now, days)
++	})
++}
++
++func CleanupSignalHistory(now time.Time) error {
++	if DB == nil {
++		return fmt.Errorf("db not initialized")
++	}
++	days, err := GetSignalHistoryRetentionDays()
++	if err != nil {
++		return err
++	}
++	if now.IsZero() {
++		now = time.Now()
++	}
++	return deleteExpiredSignalHistory(DB, now, days)
++}
++
++func deleteExpiredSignalHistory(tx *gorm.DB, now time.Time, days int) error {
++	if err := ValidateSignalHistoryRetentionDays(days); err != nil {
++		return err
++	}
++	return tx.Where("recorded_at < ?", now.UTC().AddDate(0, 0, -days)).Delete(&SignalHistory{}).Error
++}
++
++func DeleteSignalHistoryForDevice(deviceID string) error {
++	if DB == nil {
++		return fmt.Errorf("db not initialized")
++	}
++	deviceID = strings.TrimSpace(deviceID)
++	if deviceID == "" {
++		return fmt.Errorf("device_id is required")
++	}
++	return DB.Where("device_id = ?", deviceID).Delete(&SignalHistory{}).Error
++}
++
++func RecordSignalHistory(deviceID, iccid string, recordedAt time.Time, values SignalValues) error {
++	if DB == nil {
++		return fmt.Errorf("db not initialized")
++	}
++	deviceID = strings.TrimSpace(deviceID)
++	iccid = strings.TrimSpace(iccid)
++	if deviceID == "" || iccid == "" {
++		return fmt.Errorf("device_id and iccid are required")
++	}
++	if recordedAt.IsZero() {
++		recordedAt = time.Now()
++	}
++	row := SignalHistory{
++		DeviceID: deviceID, ICCID: iccid, RecordedAt: recordedAt.UTC().Truncate(time.Minute),
++		RSSI: validSignalValue(values.RSSI), RSRP: validSignalValue(values.RSRP),
++		RSRQ: validSignalValue(values.RSRQ), SINR: validSignalValue(values.SINR),
++		NR5GSINR: validSignalValue(values.NR5GSINR),
++	}
++	if row.RSSI == nil && row.RSRP == nil && row.RSRQ == nil && row.SINR == nil && row.NR5GSINR == nil {
++		return nil
++	}
++	return DB.Clauses(clause.OnConflict{
++		Columns: []clause.Column{{Name: "device_id"}, {Name: "iccid"}, {Name: "recorded_at"}},
++		DoUpdates: clause.Assignments(map[string]interface{}{
++			"rssi":       gorm.Expr("COALESCE(excluded.rssi, signal_history.rssi)"),
++			"rsrp":       gorm.Expr("COALESCE(excluded.rsrp, signal_history.rsrp)"),
++			"rsrq":       gorm.Expr("COALESCE(excluded.rsrq, signal_history.rsrq)"),
++			"sinr":       gorm.Expr("COALESCE(excluded.sinr, signal_history.sinr)"),
++			"nr5g_sinr":  gorm.Expr("COALESCE(excluded.nr5g_sinr, signal_history.nr5g_sinr)"),
++			"updated_at": time.Now().UTC(),
++		}),
++	}).Create(&row).Error
++}
++
++func validSignalValue(value int) *int {
++	if value == 0 || value == -999 {
++		return nil
++	}
++	v := value
++	return &v
++}
++
++type signalHistoryAggregateRow struct {
++	BucketUnix                       int64
++	RSSI, RSRP, RSRQ, SINR, NR5GSINR sql.NullFloat64
++	SampleCount                      int64
++}
++
++func GetSignalHistory(deviceID, iccid string, since, until time.Time, bucket time.Duration) ([]SignalHistoryPoint, error) {
++	if DB == nil {
++		return nil, fmt.Errorf("db not initialized")
++	}
++	deviceID = strings.TrimSpace(deviceID)
++	iccid = strings.TrimSpace(iccid)
++	if deviceID == "" || iccid == "" || since.IsZero() || until.IsZero() || !since.Before(until) || bucket < time.Minute {
++		return nil, fmt.Errorf("invalid signal history query")
++	}
++	seconds := int64(bucket / time.Second)
++	rows := make([]signalHistoryAggregateRow, 0)
++	query := `SELECT
++		(CAST(strftime('%s', recorded_at) AS INTEGER) / ?) * ? AS bucket_unix,
++		AVG(rssi) AS rssi, AVG(rsrp) AS rsrp, AVG(rsrq) AS rsrq,
++		AVG(sinr) AS sinr, AVG(nr5g_sinr) AS nr5g_sinr, COUNT(*) AS sample_count
++		FROM signal_history
++		WHERE device_id = ? AND iccid = ? AND recorded_at >= ? AND recorded_at <= ?
++		GROUP BY bucket_unix HAVING bucket_unix IS NOT NULL ORDER BY bucket_unix ASC`
++	if err := DB.Raw(query, seconds, seconds, deviceID, iccid, since.UTC(), until.UTC()).Scan(&rows).Error; err != nil {
++		return nil, err
++	}
++	points := make([]SignalHistoryPoint, 0, len(rows))
++	for _, row := range rows {
++		points = append(points, SignalHistoryPoint{
++			RecordedAt: time.Unix(row.BucketUnix, 0).UTC(), RSSI: nullFloat64Ptr(row.RSSI),
++			RSRP: nullFloat64Ptr(row.RSRP), RSRQ: nullFloat64Ptr(row.RSRQ),
++			SINR: nullFloat64Ptr(row.SINR), NR5GSINR: nullFloat64Ptr(row.NR5GSINR),
++			SampleCount: row.SampleCount,
++		})
++	}
++	return points, nil
++}
++
++func nullFloat64Ptr(value sql.NullFloat64) *float64 {
++	if !value.Valid {
++		return nil
++	}
++	v := value.Float64
++	return &v
++}
+diff --git a/internal/db/signal_history_test.go b/internal/db/signal_history_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..034fd3080bebb60e7fede64bdc9cc5b4554c2320
+--- /dev/null
++++ b/internal/db/signal_history_test.go
+@@ -0,0 +1,117 @@
++package db
++
++import (
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestSignalHistoryRecordAndRetention(t *testing.T) {
++	if err := Init(filepath.Join(t.TempDir(), "signal.db")); err != nil {
++		t.Fatal(err)
++	}
++	now := time.Date(2026, 7, 20, 12, 1, 0, 0, time.UTC)
++	if err := RecordSignalHistory("DJI", "iccid-a", now, SignalValues{RSSI: -80, RSRP: -100}); err != nil {
++		t.Fatal(err)
++	}
++	if err := RecordSignalHistory("DJI", "iccid-a", now.Add(20*time.Second), SignalValues{RSRQ: -12, SINR: 18}); err != nil {
++		t.Fatal(err)
++	}
++	if err := RecordSignalHistory("DJI", "iccid-a", now.Add(time.Minute), SignalValues{RSSI: -90, RSRP: -110}); err != nil {
++		t.Fatal(err)
++	}
++	// 同一设备、同一分钟切换到新 Profile 时必须形成独立记录。
++	if err := RecordSignalHistory("DJI", "iccid-b", now.Add(time.Minute), SignalValues{RSSI: -60}); err != nil {
++		t.Fatal(err)
++	}
++	var count int64
++	if err := DB.Model(&SignalHistory{}).Count(&count).Error; err != nil {
++		t.Fatal(err)
++	}
++	if count != 3 {
++		t.Fatalf("rows=%d want=3", count)
++	}
++	points, err := GetSignalHistory("DJI", "iccid-a", now.Add(-time.Minute), now.Add(10*time.Minute), 5*time.Minute)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(points) != 1 || points[0].SampleCount != 2 || points[0].RSSI == nil || *points[0].RSSI != -85 {
++		t.Fatalf("unexpected points: %+v", points)
++	}
++	profileB, err := GetSignalHistory("DJI", "iccid-b", now.Add(-time.Minute), now.Add(10*time.Minute), 5*time.Minute)
++	if err != nil || len(profileB) != 1 || profileB[0].RSSI == nil || *profileB[0].RSSI != -60 {
++		t.Fatalf("profile B mixed or missing: points=%+v err=%v", profileB, err)
++	}
++	if err := RecordSignalHistory("old", "old-iccid", now.AddDate(0, 0, -8), SignalValues{RSSI: -100}); err != nil {
++		t.Fatal(err)
++	}
++	if err := SetSignalHistoryRetentionDays(7, now); err != nil {
++		t.Fatal(err)
++	}
++	if err := DB.Model(&SignalHistory{}).Where("device_id = ?", "old").Count(&count).Error; err != nil {
++		t.Fatal(err)
++	}
++	if count != 0 {
++		t.Fatalf("expired rows=%d", count)
++	}
++}
++
++func TestValidateSignalHistoryRetentionDays(t *testing.T) {
++	if ValidateSignalHistoryRetentionDays(0) == nil || ValidateSignalHistoryRetentionDays(3651) == nil {
++		t.Fatal("invalid retention accepted")
++	}
++	if err := ValidateSignalHistoryRetentionDays(30); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestSignalHistoryMigratesDeviceOnlySchema(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "legacy-signal.db")
++	if err := Init(path); err != nil {
++		t.Fatal(err)
++	}
++	if err := DB.Migrator().DropTable(&SignalHistory{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := DB.Exec(`CREATE TABLE signal_history (
++		id integer PRIMARY KEY AUTOINCREMENT,
++		device_id text NOT NULL,
++		recorded_at datetime NOT NULL,
++		rssi integer, rsrp integer, rsrq integer, sinr integer, nr5g_sinr integer,
++		created_at datetime, updated_at datetime
++	)`).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := DB.Exec("CREATE UNIQUE INDEX uk_signal_history_device_time ON signal_history(device_id, recorded_at)").Error; err != nil {
++		t.Fatal(err)
++	}
++	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
++	if err := DB.Exec("INSERT INTO signal_history(device_id, recorded_at, rssi) VALUES(?, ?, ?)", "DJI", now, -100).Error; err != nil {
++		t.Fatal(err)
++	}
++	if sqlDB, err := DB.DB(); err == nil {
++		_ = sqlDB.Close()
++	}
++	if err := Init(path); err != nil {
++		t.Fatal(err)
++	}
++	if !DB.Migrator().HasColumn(&SignalHistory{}, "ICCID") {
++		t.Fatal("ICCID column was not added")
++	}
++	if DB.Migrator().HasIndex(&SignalHistory{}, "uk_signal_history_device_time") {
++		t.Fatal("legacy device-only unique index was not removed")
++	}
++	if err := RecordSignalHistory("DJI", "iccid-a", now, SignalValues{RSSI: -80}); err != nil {
++		t.Fatal(err)
++	}
++	if err := RecordSignalHistory("DJI", "iccid-b", now, SignalValues{RSSI: -60}); err != nil {
++		t.Fatal(err)
++	}
++	var count int64
++	if err := DB.Model(&SignalHistory{}).Where("device_id = ? AND recorded_at = ?", "DJI", now).Count(&count).Error; err != nil {
++		t.Fatal(err)
++	}
++	if count != 3 {
++		t.Fatalf("same minute rows after migration=%d want=3", count)
++	}
++}
+diff --git a/internal/device/pool.go b/internal/device/pool.go
+index eaeb13794c0b42f00229a7d6fc6669ae9b93642d..7c29a9e97278e07ed48a0fbe942d2eced39e3dac 100644
+--- a/internal/device/pool.go
++++ b/internal/device/pool.go
+@@ -151,6 +151,10 @@ type Worker struct {
+ 	healthGraceUntil          time.Time
+ 	healthSnapshot            HealthSnapshot
+ 
++	signalHistoryMu     sync.Mutex
++	signalHistoryMinute time.Time
++	signalHistoryICCID  string
++
+ 	streamSubs          atomic.Int32 // 单设备的流订阅计数器
+ 	uimIndicationsReady atomic.Bool  // worker 完成启动注册后才处理 UIM 事件触发的重扫/重载
+ 	// switchEvents receives UIM indications for the active eSIM switch; nil outside switch convergence.
+@@ -515,6 +519,7 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
+ 		defer cancel()
+ 	}
+ 
++	historyICCID, historyGeneration := w.confirmedSignalHistoryIdentity()
+ 	status := w.collectRuntimeStatus(ctx, reason)
+ 	healthy := w.IsDeviceHealthy()
+ 
+@@ -524,6 +529,37 @@ func (w *Worker) RefreshRuntime(ctx context.Context, reason string) error {
+ 		w.state.Meta.Healthy = healthy
+ 	}
+ 	w.cacheMu.Unlock()
++	confirmedICCID, confirmedGeneration := w.confirmedSignalHistoryIdentity()
++	if historyICCID != "" && historyICCID == confirmedICCID && historyGeneration == confirmedGeneration {
++		if err := w.persistSignalHistory(status, confirmedICCID, time.Now()); err != nil {
++			logger.Warn("保存信号历史失败", "device", w.ID, "iccid", confirmedICCID, "err", err)
++		}
++	}
++	return nil
++}
++
++func (w *Worker) persistSignalHistory(status modem.DeviceStatus, iccid string, recordedAt time.Time) error {
++	if w == nil || db.DB == nil {
++		return nil
++	}
++	iccid = strings.TrimSpace(iccid)
++	if iccid == "" {
++		return nil
++	}
++	minute := recordedAt.UTC().Truncate(time.Minute)
++	w.signalHistoryMu.Lock()
++	defer w.signalHistoryMu.Unlock()
++	if w.signalHistoryICCID == iccid && !w.signalHistoryMinute.IsZero() && w.signalHistoryMinute.Equal(minute) {
++		return nil
++	}
++	if err := db.RecordSignalHistory(w.ID, iccid, minute, db.SignalValues{
++		RSSI: status.SignalDBM, RSRP: status.SignalRSRP, RSRQ: status.SignalRSRQ,
++		SINR: status.SignalSINR, NR5GSINR: status.NR5GSignalSINR,
++	}); err != nil {
++		return err
++	}
++	w.signalHistoryMinute = minute
++	w.signalHistoryICCID = iccid
+ 	return nil
+ }
+ 
+diff --git a/internal/device/pool_state.go b/internal/device/pool_state.go
+index 9542ec03d0a25c055c2c10ffb055031191d1ab06..5a93f8f2d550df8718350e7ff76843780d709060 100644
+--- a/internal/device/pool_state.go
++++ b/internal/device/pool_state.go
+@@ -406,3 +406,25 @@ func (w *Worker) CurrentICCID() string {
+ 	}
+ 	return w.state.Identity.ICCID
+ }
++
++// ConfirmedICCID returns only the ICCID that has completed identity
++// convergence. Unlike CurrentICCID it never exposes TargetICCID during an
++// eSIM switch, so callers cannot attribute old-card data to the new profile.
++func (w *Worker) ConfirmedICCID() string {
++	iccid, _ := w.confirmedSignalHistoryIdentity()
++	return iccid
++}
++
++func (w *Worker) confirmedSignalHistoryIdentity() (string, uint64) {
++	if w == nil {
++		return "", 0
++	}
++	w.cacheMu.RLock()
++	defer w.cacheMu.RUnlock()
++	identity := w.state.Identity
++	if !identity.Ready || strings.TrimSpace(identity.TargetICCID) != "" ||
++		identity.Phase == simIdentityPhaseTransitioning || identity.Phase == simIdentityPhaseDegraded {
++		return "", identity.Generation
++	}
++	return strings.TrimSpace(identity.ICCID), identity.Generation
++}
+diff --git a/internal/device/signal_history_test.go b/internal/device/signal_history_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec4c82e20b89a459d176c7881dae155daae3dc7e
+--- /dev/null
++++ b/internal/device/signal_history_test.go
+@@ -0,0 +1,54 @@
++package device
++
++import (
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/boa-z/vohive/internal/db"
++	"github.com/boa-z/vohive/internal/modem"
++)
++
++func TestWorkerPersistsSignalHistoryOncePerMinute(t *testing.T) {
++	if err := db.Init(filepath.Join(t.TempDir(), "signal.db")); err != nil {
++		t.Fatal(err)
++	}
++	w := &Worker{ID: "DJI"}
++	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
++	if err := w.persistSignalHistory(modem.DeviceStatus{SignalDBM: -80}, "iccid-a", now); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.persistSignalHistory(modem.DeviceStatus{SignalDBM: -90}, "iccid-a", now.Add(20*time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.persistSignalHistory(modem.DeviceStatus{SignalDBM: -60}, "iccid-b", now.Add(30*time.Second)); err != nil {
++		t.Fatal(err)
++	}
++	if err := w.persistSignalHistory(modem.DeviceStatus{SignalDBM: -90}, "iccid-b", now.Add(time.Minute)); err != nil {
++		t.Fatal(err)
++	}
++	var rows []db.SignalHistory
++	if err := db.DB.Where("device_id = ?", "DJI").Order("recorded_at, iccid").Find(&rows).Error; err != nil {
++		t.Fatal(err)
++	}
++	if len(rows) != 3 || rows[0].ICCID != "iccid-a" || rows[1].ICCID != "iccid-b" {
++		t.Fatalf("rows=%+v", rows)
++	}
++}
++
++func TestConfirmedICCIDSuppressesESIMTransitionTarget(t *testing.T) {
++	w := &Worker{ID: "DJI"}
++	w.state.Identity.ICCID = "iccid-a"
++	w.state.Identity.Ready = true
++	w.state.Identity.Phase = simIdentityPhaseReady
++	if got := w.ConfirmedICCID(); got != "iccid-a" {
++		t.Fatalf("ConfirmedICCID()=%q", got)
++	}
++	w.BeginSIMIdentityTransition("iccid-b", "test")
++	if got := w.ConfirmedICCID(); got != "" {
++		t.Fatalf("transition target leaked as confirmed ICCID: %q", got)
++	}
++	if got := w.CurrentICCID(); got != "iccid-b" {
++		t.Fatalf("CurrentICCID()=%q want target", got)
++	}
++}
+diff --git a/web/src/components.d.ts b/web/src/components.d.ts
+index 92303421fc87268a33da63c87ff6290e97e978fb..0a78bd965b2051c635ee1b0ecab01ada97fce938 100644
+--- a/web/src/components.d.ts
++++ b/web/src/components.d.ts
+@@ -67,6 +67,7 @@ declare module 'vue' {
+     RefreshButton: typeof import('./components/RefreshButton.vue')['default']
+     RouterLink: typeof import('vue-router')['RouterLink']
+     RouterView: typeof import('vue-router')['RouterView']
++    SignalHistoryPanel: typeof import('./components/SignalHistoryPanel.vue')['default']
+     StatusLight: typeof import('./components/StatusLight.vue')['default']
+     SwitchDark: typeof import('./components/SwitchDark.vue')['default']
+     TrafficAnalysisPanel: typeof import('./components/TrafficAnalysisPanel.vue')['default']
+diff --git a/web/src/components/DeviceOverviewTab.vue b/web/src/components/DeviceOverviewTab.vue
+index 0652639c3ace130513317805327f78c700033769..8e5d8161303e0076528d00810a1f872d0d12d67f 100644
+--- a/web/src/components/DeviceOverviewTab.vue
++++ b/web/src/components/DeviceOverviewTab.vue
+@@ -7,6 +7,7 @@ import { activeEsimProfileDisplayName } from './deviceOverviewActiveEsim'
+ import { isControlOnline, isRadioRegistered, isRecoveryPhase, lifecycleStatusLabel } from '../utils/deviceLifecycle'
+ import StatusLight from './StatusLight.vue'
+ import OperatorSelectionDialog from './OperatorSelectionDialog.vue'
++import SignalHistoryPanel from './SignalHistoryPanel.vue'
+ import { Settings24Regular } from '@vicons/fluent'
+ import type { StatusLightTone } from './statusLight'
+ 
+@@ -374,6 +375,14 @@ const networkPanelMessage = computed(() => {
+       </div>
+     </div>
+ 
++    <SignalHistoryPanel
++      v-if="device?.id"
++      :device-id="device.id"
++      :iccid="device.modem?.iccid || ''"
++      :profile-name="device.active_esim_profile_name || ''"
++      class="lg:col-span-3"
++    />
++
+     <!-- 运营商选择弹窗 -->
+     <OperatorSelectionDialog
+       v-if="device?.id"
+diff --git a/web/src/components/SignalHistoryPanel.vue b/web/src/components/SignalHistoryPanel.vue
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b457857e3830a7471f8354049cf04c4d970b8ad
+--- /dev/null
++++ b/web/src/components/SignalHistoryPanel.vue
+@@ -0,0 +1,184 @@
++<script setup lang="ts">
++import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
++import { ElMessage } from 'element-plus'
++import VChart from 'vue-echarts'
++import { use } from 'echarts/core'
++import { CanvasRenderer } from 'echarts/renderers'
++import { LineChart } from 'echarts/charts'
++import { DataZoomComponent, GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
++import { devicesService } from '../services/devices'
++import type { AppError } from '../types/domain'
++import type { SignalHistoryRange, SignalHistoryResponse, SignalHistorySetting } from '../types/api'
++
++use([CanvasRenderer, LineChart, DataZoomComponent, GridComponent, LegendComponent, TooltipComponent])
++
++const props = defineProps<{
++  deviceId: string
++  iccid?: string
++  profileName?: string
++}>()
++const range = ref<SignalHistoryRange>('day')
++const history = ref<SignalHistoryResponse | null>(null)
++const setting = ref<SignalHistorySetting | null>(null)
++const retentionDays = ref(30)
++const loading = ref(false)
++const saving = ref(false)
++const error = ref<AppError | null>(null)
++let controller: AbortController | null = null
++let requestID = 0
++let refreshTimer: number | null = null
++let lastLoadedAt = 0
++
++const ranges: Array<{ value: SignalHistoryRange; label: string }> = [
++  { value: 'day', label: '24小时' },
++  { value: 'week', label: '7天' },
++  { value: 'month', label: '30天' },
++  { value: 'retention', label: '全部' }
++]
++
++const points = computed(() => history.value?.points || [])
++const hasData = computed(() => points.value.some(point =>
++  [point.rssi, point.rsrp, point.rsrq, point.sinr, point.nr5g_sinr].some(value => typeof value === 'number')
++))
++const profileLabel = computed(() => {
++  const name = props.profileName?.trim() || ''
++  const iccid = props.iccid?.trim() || ''
++  const shortICCID = iccid ? `••••${iccid.slice(-6)}` : ''
++  return [name, shortICCID].filter(Boolean).join(' · ')
++})
++
++async function loadHistory(showLoading = true) {
++  const id = props.deviceId.trim()
++  const requestedRange = range.value
++  const idNumber = ++requestID
++  controller?.abort()
++  if (!id) return
++  const current = new AbortController()
++  controller = current
++  if (showLoading) loading.value = true
++  error.value = null
++  const result = await devicesService.getSignalHistory(id, requestedRange, current.signal)
++  if (idNumber !== requestID) return
++  loading.value = false
++  controller = null
++  if (!result.ok) {
++    if (result.error.code !== 'ERR_CANCELED') error.value = result.error
++    return
++  }
++  history.value = result.data
++  lastLoadedAt = Date.now()
++}
++
++async function loadSetting() {
++  const result = await devicesService.getSignalHistorySetting()
++  if (!result.ok) {
++    ElMessage.error(result.error.message || '读取信号历史设置失败')
++    return
++  }
++  setting.value = result.data
++  retentionDays.value = result.data.retention_days
++}
++
++async function saveSetting() {
++  const min = setting.value?.min_days ?? 1
++  const max = setting.value?.max_days ?? 3650
++  const days = Math.trunc(Number(retentionDays.value))
++  if (!Number.isFinite(days) || days < min || days > max) {
++    ElMessage.warning(`保留天数必须在 ${min} 到 ${max} 之间`)
++    return
++  }
++  saving.value = true
++  const result = await devicesService.updateSignalHistorySetting(days)
++  saving.value = false
++  if (!result.ok) {
++    ElMessage.error(result.error.message || '保存失败')
++    return
++  }
++  setting.value = result.data
++  retentionDays.value = result.data.retention_days
++  ElMessage.success('保留设置已保存，过期记录已清理')
++  if (range.value === 'retention') await loadHistory()
++}
++
++function handleRangeChange(value: string | number | boolean | undefined) {
++  if (value === 'day' || value === 'week' || value === 'month' || value === 'retention') range.value = value
++}
++
++const chartOption = computed(() => {
++  const data = (key: 'rssi' | 'rsrp' | 'rsrq' | 'sinr' | 'nr5g_sinr') =>
++    points.value.map(point => [point.recorded_at, point[key]])
++  return {
++    animation: false,
++    backgroundColor: 'transparent',
++    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
++    legend: { type: 'scroll', top: 0, textStyle: { color: '#9ca3af' } },
++    grid: { left: 20, right: 20, top: 52, bottom: 42, containLabel: true },
++    dataZoom: [{ type: 'inside', filterMode: 'none' }],
++    xAxis: { type: 'time', axisLabel: { color: '#9ca3af', hideOverlap: true } },
++    yAxis: [
++      { type: 'value', name: 'dBm', position: 'left', axisLabel: { color: '#9ca3af' }, splitLine: { lineStyle: { type: 'dashed', opacity: 0.2 } } },
++      { type: 'value', name: 'dB', position: 'right', axisLabel: { color: '#9ca3af' }, splitLine: { show: false } }
++    ],
++    series: [
++      { name: 'RSSI (dBm)', type: 'line', yAxisIndex: 0, data: data('rssi'), symbol: 'none', connectNulls: false },
++      { name: 'RSRP (dBm)', type: 'line', yAxisIndex: 0, data: data('rsrp'), symbol: 'none', connectNulls: false },
++      { name: 'RSRQ (dB)', type: 'line', yAxisIndex: 1, data: data('rsrq'), symbol: 'none', connectNulls: false },
++      { name: 'SINR (dB)', type: 'line', yAxisIndex: 1, data: data('sinr'), symbol: 'none', connectNulls: false },
++      { name: 'NR5G SINR (dB)', type: 'line', yAxisIndex: 1, data: data('nr5g_sinr'), symbol: 'none', connectNulls: false }
++    ]
++  }
++})
++
++watch(() => [props.deviceId, props.iccid] as const, () => {
++  history.value = null
++  void loadHistory()
++}, { immediate: true })
++
++watch(range, () => void loadHistory())
++
++onMounted(() => {
++  void loadSetting()
++  refreshTimer = window.setInterval(() => {
++    const interval = document.hidden ? 5 * 60_000 : 60_000
++    if (Date.now() - lastLoadedAt >= interval) void loadHistory(false)
++  }, 60_000)
++})
++
++onBeforeUnmount(() => {
++  controller?.abort()
++  requestID++
++  if (refreshTimer !== null) window.clearInterval(refreshTimer)
++})
++</script>
++
++<template>
++  <section class="ui-panel-muted p-4 overflow-hidden">
++    <div class="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3 mb-4">
++      <div>
++        <div class="text-sm font-bold text-gray-800 dark:text-gray-100">信号强度历史</div>
++        <div class="text-xs text-gray-400 mt-1">
++          <template v-if="profileLabel">当前 eSIM：{{ profileLabel }}；每分钟保存一次</template>
++          <template v-else>等待 SIM/eSIM 身份确认，切换期间暂停记录</template>
++        </div>
++      </div>
++      <div class="flex flex-wrap items-center gap-2">
++        <el-radio-group :model-value="range" size="small" @change="handleRangeChange">
++          <el-radio-button v-for="item in ranges" :key="item.value" :label="item.value">{{ item.label }}</el-radio-button>
++        </el-radio-group>
++        <el-button size="small" :loading="loading" @click="loadHistory()">刷新</el-button>
++        <span class="text-xs text-gray-500">全局保留</span>
++        <el-input-number v-model="retentionDays" size="small" :min="setting?.min_days ?? 1" :max="setting?.max_days ?? 3650" :controls="false" class="!w-20" />
++        <span class="text-xs text-gray-500">天</span>
++        <el-button size="small" :loading="saving" @click="saveSetting">保存</el-button>
++      </div>
++    </div>
++    <div v-if="error" class="h-[260px] flex flex-col items-center justify-center gap-3 text-sm text-red-500">
++      <span>{{ error.message }}</span><el-button size="small" @click="loadHistory()">重试</el-button>
++    </div>
++    <div v-else-if="loading && !history" class="h-[260px]" v-loading="true" />
++    <VChart v-else-if="hasData" :option="chartOption" autoresize class="h-[320px] w-full" />
++    <div v-else class="h-[220px] rounded-xl border border-dashed border-gray-200 dark:border-white/10 flex items-center justify-center text-sm text-gray-400">
++      {{ history && !history.identity_ready ? 'eSIM 切换中，身份确认后将自动显示新 Profile 的历史' : '当前 SIM/eSIM 暂无信号历史数据' }}
++    </div>
++  </section>
++</template>
+diff --git a/web/src/services/devices.ts b/web/src/services/devices.ts
+index 0c20c160ae6d1cc949d74267df55c92ef0d6e008..274661ce21479371eccfdbaf6f499e916b48d5dc 100644
+--- a/web/src/services/devices.ts
++++ b/web/src/services/devices.ts
+@@ -1,6 +1,6 @@
+ import { api } from '../stores/auth'
+ import { callService } from './http'
+-import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta } from '../types/api'
++import type { CarrierWebsheetInfo, DeviceConfigDTO, DiscoveredDevice, EsimNotificationItem, EsimOverviewResponse, EsimSpaceDelta, SignalHistoryRange, SignalHistoryResponse, SignalHistorySetting } from '../types/api'
+ import type { DeviceDetailVM, DeviceListVM } from '../types/view-model'
+ import axios from 'axios'
+ 
+@@ -117,6 +117,24 @@ export const devicesService = {
+       return ((res.data?.devices || [])[0] || null) as DeviceDetailVM | null
+     })
+   },
++  getSignalHistory(id: string, range: SignalHistoryRange, signal?: AbortSignal) {
++    return callService(async () => {
++      const res = await api.get<SignalHistoryResponse>(`/devices/${id}/signal-history`, { params: { range }, signal })
++      return res.data
++    })
++  },
++  getSignalHistorySetting(signal?: AbortSignal) {
++    return callService(async () => {
++      const res = await api.get<SignalHistorySetting>('/settings/signal-history', { signal })
++      return res.data
++    })
++  },
++  updateSignalHistorySetting(retentionDays: number) {
++    return callService(async () => {
++      const res = await api.put<SignalHistorySetting>('/settings/signal-history', { retention_days: retentionDays })
++      return res.data
++    })
++  },
+   getConfig(id: string) {
+     return callService(async () => {
+       const res = await api.get(`/devices/${id}/config`)
+diff --git a/web/src/types/api.ts b/web/src/types/api.ts
+index d7637b27c92604c2abd3f26c6ad8b94b5820ee68..3bb31b70627b9973fec48cd35f140ea9ffa41ef2 100644
+--- a/web/src/types/api.ts
++++ b/web/src/types/api.ts
+@@ -205,6 +205,33 @@ export type ModemStatus = {
+   operating_mode?: number
+ }
+ 
++export type SignalHistoryRange = 'day' | 'week' | 'month' | 'retention'
++export type SignalHistoryPoint = {
++  recorded_at: string
++  rssi: number | null
++  rsrp: number | null
++  rsrq: number | null
++  sinr: number | null
++  nr5g_sinr: number | null
++  sample_count: number
++}
++export type SignalHistoryResponse = {
++  device_id: string
++  iccid: string
++  identity_ready: boolean
++  range: SignalHistoryRange
++  retention_days: number
++  since: string
++  until: string
++  bucket_seconds: number
++  points: SignalHistoryPoint[]
++}
++export type SignalHistorySetting = {
++  retention_days: number
++  min_days: number
++  max_days: number
++}
++
+ export type EsimSpaceDelta = {
+   direction: 'released' | 'consumed'
+   bytes: number
