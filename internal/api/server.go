@@ -252,6 +252,8 @@ func (s *Server) newRouter() *gin.Engine {
 		// ===== 系统设置 =====
 		api.GET("/settings/notifications", s.handleGetNotificationSettings)    // 获取通知设置
 		api.PUT("/settings/notifications", s.handleUpdateNotificationSettings) // 更新通知设置
+		api.GET("/settings/signal-history", s.handleGetSignalHistorySetting)
+		api.PUT("/settings/signal-history", s.handleUpdateSignalHistorySetting)
 		api.POST("/settings/notifications/webhook/test", s.handleTestWebhookNotification)
 		api.POST("/settings/notifications/bark/test", s.handleTestBarkNotification)
 		api.POST("/settings/notifications/email/test", s.handleTestEmailNotification)
@@ -266,17 +268,18 @@ func (s *Server) newRouter() *gin.Engine {
 		api.POST("/devices/actions/rescan", s.handleDeviceRescan)                              // 手动触发设备重扫描
 		api.GET("/devices/:device_id/overview/stream", s.handleDeviceMgmtOverviewStreamSingle) // SSE 单体深层实时流
 		api.GET("/devices/:device_id/overview", s.handleDeviceMgmtOverviewLite)                // 获取设备详情（轻量版）
-		api.GET("/devices/:device_id/config", s.handleDeviceMgmtGetDeviceConfig)               // 获取设备配置
-		api.PUT("/devices/:device_id", s.handleDeviceMgmtUpdateDevice)                         // 更新设备配置
-		api.DELETE("/devices/:device_id", s.handleDeviceMgmtDeleteDevice)                      // 删除设备
-		api.POST("/devices/:device_id/actions/refresh", s.handleDeviceMgmtRefreshInfo)         // 手动触发刷新设备缓存信息
-		api.POST("/devices/:device_id/actions/reboot", s.handleDeviceMgmtReboot)               // 重启设备模组
-		api.POST("/devices/:device_id/actions/at", s.handleDeviceMgmtExecuteAT)                // 执行 AT 命令
-		api.POST("/devices/:device_id/actions/ussd", s.handleDeviceMgmtExecuteUSSD)            // 执行 USSD 指令
-		api.POST("/devices/:device_id/actions/ussd/continue", s.handleDeviceMgmtContinueUSSD)  // USSD 续轮输入（多轮交互）
-		api.POST("/devices/:device_id/actions/ussd/cancel", s.handleDeviceMgmtCancelUSSD)      // 取消 USSD 会话
-		api.PATCH("/devices/:device_id/usbnet-mode", s.handleDeviceMgmtSetUSBNetMode)          // 设置 USBNET 模式
-		api.PATCH("/devices/:device_id/flight-mode", s.handleDeviceMgmtSetFlightMode)          // 切换飞行模式
+		api.GET("/devices/:device_id/signal-history", s.handleGetDeviceSignalHistory)
+		api.GET("/devices/:device_id/config", s.handleDeviceMgmtGetDeviceConfig)              // 获取设备配置
+		api.PUT("/devices/:device_id", s.handleDeviceMgmtUpdateDevice)                        // 更新设备配置
+		api.DELETE("/devices/:device_id", s.handleDeviceMgmtDeleteDevice)                     // 删除设备
+		api.POST("/devices/:device_id/actions/refresh", s.handleDeviceMgmtRefreshInfo)        // 手动触发刷新设备缓存信息
+		api.POST("/devices/:device_id/actions/reboot", s.handleDeviceMgmtReboot)              // 重启设备模组
+		api.POST("/devices/:device_id/actions/at", s.handleDeviceMgmtExecuteAT)               // 执行 AT 命令
+		api.POST("/devices/:device_id/actions/ussd", s.handleDeviceMgmtExecuteUSSD)           // 执行 USSD 指令
+		api.POST("/devices/:device_id/actions/ussd/continue", s.handleDeviceMgmtContinueUSSD) // USSD 续轮输入（多轮交互）
+		api.POST("/devices/:device_id/actions/ussd/cancel", s.handleDeviceMgmtCancelUSSD)     // 取消 USSD 会话
+		api.PATCH("/devices/:device_id/usbnet-mode", s.handleDeviceMgmtSetUSBNetMode)         // 设置 USBNET 模式
+		api.PATCH("/devices/:device_id/flight-mode", s.handleDeviceMgmtSetFlightMode)         // 切换飞行模式
 		api.PATCH("/devices/:device_id/network", s.handleDeviceNetworkPatch)
 
 		api.GET("/cards/policies", s.handleListCardPolicies)

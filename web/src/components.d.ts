@@ -67,6 +67,7 @@ declare module 'vue' {
     RefreshButton: typeof import('./components/RefreshButton.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    SignalHistoryPanel: typeof import('./components/SignalHistoryPanel.vue')['default']
     StatusLight: typeof import('./components/StatusLight.vue')['default']
     SwitchDark: typeof import('./components/SwitchDark.vue')['default']
     TrafficAnalysisPanel: typeof import('./components/TrafficAnalysisPanel.vue')['default']
